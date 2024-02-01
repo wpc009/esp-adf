@@ -7,6 +7,9 @@
    CONDITIONS OF ANY KIND, either express or implied.
 */
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_peripherals.h"
@@ -22,6 +25,15 @@
 #include "a2dp_stream.h"
 #include "fatfs_stream.h"
 
+#include "periph_sdcard.h"
+#include "periph_touch.h"
+#include "periph_button.h"
+#include "input_key_service.h"
+#include "periph_adc_button.h"
+
+#include "sdcard_list.h"
+#include "sdcard_scan.h"
+
 #define BT_CONNECT_TIMEOUT      20000
 
 typedef uint8_t esp_peer_bdname_t[ESP_BT_GAP_MAX_BDNAME_LEN + 1];
@@ -30,6 +42,9 @@ static const char *TAG = "BLUETOOTH_SOURCE_EXAMPLE";
 static esp_peer_bdname_t remote_bt_device_name;
 static bool device_found = false;
 static esp_bd_addr_t remote_bd_addr = {0};
+audio_pipeline_handle_t pipeline;
+audio_element_handle_t fatfs_stream_reader, mp3_decoder,bt_stream_writer;
+playlist_operator_handle_t sdcard_list_handle = NULL;
 
 static char *bda2str(esp_bd_addr_t bda, char *str, size_t size)
 {
@@ -165,11 +180,140 @@ static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
     return;
 }
 
+void sdcard_url_save_cb(void *user_data, char *url)
+{
+    playlist_operator_handle_t sdcard_handle = (playlist_operator_handle_t)user_data;
+    esp_err_t ret = sdcard_list_save(sdcard_handle, url);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Fail to save sdcard url to sdcard playlist");
+    }
+}
+
+static esp_err_t input_key_service_cb(periph_service_handle_t handle, periph_service_event_t *evt, void *ctx)
+{
+    /* Handle touch pad events
+           to start, pause, resume, finish current song and adjust volume
+        */
+    audio_board_handle_t board_handle = (audio_board_handle_t) ctx;
+    int player_volume;
+    audio_hal_get_volume(board_handle->audio_hal, &player_volume);
+
+    if (evt->type == INPUT_KEY_SERVICE_ACTION_CLICK_RELEASE) {
+        ESP_LOGI(TAG, "[ * ] input key id is %d", (int)evt->data);
+        switch ((int)evt->data) {
+            case INPUT_KEY_USER_ID_PLAY:
+                ESP_LOGI(TAG, "[ * ] [Play] input key event");
+                if (pipeline == NULL) break;
+                audio_element_state_t el_state = audio_element_get_state(bt_stream_writer);
+                switch (el_state) {
+                    case AEL_STATE_INIT :
+                        ESP_LOGI(TAG, "[ * ] Starting audio pipeline");
+                        audio_pipeline_run(pipeline);
+                        break;
+                    case AEL_STATE_RUNNING :
+                        ESP_LOGI(TAG, "[ * ] Pausing audio pipeline");
+                        audio_pipeline_pause(pipeline);
+                        break;
+                    case AEL_STATE_PAUSED :
+                        ESP_LOGI(TAG, "[ * ] Resuming audio pipeline");
+                        audio_pipeline_resume(pipeline);
+                        break;
+                    default :
+                        ESP_LOGI(TAG, "[ * ] Not supported state %d", el_state);
+                }
+                break;
+            case INPUT_KEY_USER_ID_SET:
+                ESP_LOGI(TAG, "[ * ] [Set] input key event");
+                ESP_LOGI(TAG, "[ * ] Stopped, advancing to the next song");
+                char *url = NULL;
+                audio_pipeline_stop(pipeline);
+                audio_pipeline_wait_for_stop(pipeline);
+                audio_pipeline_terminate(pipeline);
+                sdcard_list_next(sdcard_list_handle, 1, &url);
+                ESP_LOGW(TAG, "URL: %s", url);
+                audio_element_set_uri(fatfs_stream_reader, url);
+                audio_pipeline_reset_ringbuffer(pipeline);
+                audio_pipeline_reset_elements(pipeline);
+                audio_pipeline_change_state(pipeline, AEL_STATE_INIT);
+                audio_pipeline_run(pipeline);
+                break;
+            case INPUT_KEY_USER_ID_VOLUP:
+                ESP_LOGI(TAG, "[ * ] [Vol+] input key event");
+                player_volume += 10;
+                if (player_volume > 100) {
+                    player_volume = 100;
+                }
+                audio_hal_set_volume(board_handle->audio_hal, player_volume);
+                ESP_LOGI(TAG, "[ * ] Volume set to %d %%", player_volume);
+                break;
+            case INPUT_KEY_USER_ID_VOLDOWN:
+                ESP_LOGI(TAG, "[ * ] [Vol-] input key event");
+                player_volume -= 10;
+                if (player_volume < 0) {
+                    player_volume = 0;
+                }
+                audio_hal_set_volume(board_handle->audio_hal, player_volume);
+                ESP_LOGI(TAG, "[ * ] Volume set to %d %%", player_volume);
+                break;
+        }
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t input_key_check_cb(periph_service_handle_t handle, periph_service_event_t *evt, void *ctx)
+{
+    ESP_LOGI(TAG, "[ * ] input key id is %d, %d", (int)evt->data, evt->type);
+    const char *key_types[INPUT_KEY_SERVICE_ACTION_PRESS_RELEASE + 1] = {"UNKNOWN", "CLICKED", "CLICK RELEASED", "PRESSED", "PRESS RELEASED"};
+    switch ((int)evt->data) {
+        case INPUT_KEY_USER_ID_REC:
+            ESP_LOGI(TAG, "[ * ] [Rec] KEY %s", key_types[evt->type]);
+            break;
+        case INPUT_KEY_USER_ID_SET:
+            ESP_LOGI(TAG, "[ * ] [SET] KEY %s", key_types[evt->type]);
+            break;
+        case INPUT_KEY_USER_ID_PLAY:
+            ESP_LOGI(TAG, "[ * ] [Play] KEY %s", key_types[evt->type]);
+            break;
+        case INPUT_KEY_USER_ID_MODE:
+            ESP_LOGI(TAG, "[ * ] [MODE] KEY %s", key_types[evt->type]);
+            break;
+        case INPUT_KEY_USER_ID_VOLDOWN:
+            ESP_LOGI(TAG, "[ * ] [Vol-] KEY %s", key_types[evt->type]);
+            break;
+        case INPUT_KEY_USER_ID_VOLUP:
+            ESP_LOGI(TAG, "[ * ] [Vol+] KEY %s", key_types[evt->type]);
+            break;
+        case INPUT_KEY_USER_ID_MUTE:
+            ESP_LOGI(TAG, "[ * ] [MUTE] KEY %s", key_types[evt->type]);
+            break;
+        case INPUT_KEY_USER_ID_CAPTURE:
+            ESP_LOGI(TAG, "[ * ] [CAPTURE] KEY %s", key_types[evt->type]);
+            break;
+        case INPUT_KEY_USER_ID_MSG:
+            ESP_LOGI(TAG, "[ * ] [MSG] KEY %s", key_types[evt->type]);
+            break;
+        case INPUT_KEY_USER_ID_BATTERY_CHARGING:
+            ESP_LOGI(TAG, "[ * ] [BATTERY_CHARGING] KEY %s", key_types[evt->type]);
+            break;
+        case INPUT_KEY_USER_ID_WAKEUP:
+            ESP_LOGI(TAG, "[ * ] [WAKEUP] KEY %s", key_types[evt->type]);
+            break;
+        case INPUT_KEY_USER_ID_COLOR:
+            ESP_LOGI(TAG, "[ * ] [COLOR] KEY %s", key_types[evt->type]);
+            break;
+        default:
+            ESP_LOGE(TAG, "User Key ID[%d] does not support", (int)evt->data);
+            break;
+    }
+
+    return ESP_OK;
+}
+
 void app_main(void)
 {
-    audio_pipeline_handle_t pipeline;
-    audio_element_handle_t fatfs_stream_reader, bt_stream_writer, mp3_decoder;
 
+    esp_err_t ret;
     esp_log_level_set("*", ESP_LOG_WARN);
     esp_log_level_set(TAG, ESP_LOG_INFO);
 
@@ -181,17 +325,42 @@ void app_main(void)
         err = nvs_flash_init();
     }
 
-    ESP_LOGI(TAG, "[ 1 ] Mount sdcard");
+    ESP_LOGI(TAG, "[1.0] Initialize peripherals management");
     // Initialize peripherals management
     esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
     esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
 
     // Initialize SD Card peripheral
-    audio_board_sdcard_init(set, SD_MODE_1_LINE);
+    ESP_LOGI(TAG, "[1.1] Initialize and start peripherals");
+    audio_board_key_init(set);
+    ret = audio_board_sdcard_init(set, SD_MODE_1_LINE);
+    if (ret != ESP_OK){
+        ESP_LOGW(TAG, "sdcard init failed.");
+    }
+
+    ESP_LOGI(TAG, "[1.2] Set up a sdcard playlist and scan sdcard music save to it");
+    sdcard_list_create(&sdcard_list_handle);
+    sdcard_scan(sdcard_url_save_cb, "/sdcard", 0, (const char *[]) {"mp3"}, 1, sdcard_list_handle);
+    sdcard_list_show(sdcard_list_handle);
 
     ESP_LOGI(TAG, "[ 2 ] Start codec chip");
     audio_board_handle_t board_handle = audio_board_init();
     audio_hal_ctrl_codec(board_handle->audio_hal, AUDIO_HAL_CODEC_MODE_DECODE, AUDIO_HAL_CTRL_START);
+
+    ESP_LOGI(TAG, "[ 2.1 ] Create and start input key service");
+    input_key_service_info_t input_key_info[] = INPUT_KEY_DEFAULT_INFO();
+    input_key_service_cfg_t input_cfg = INPUT_KEY_SERVICE_DEFAULT_CONFIG();
+    input_cfg.handle = set;
+    input_cfg.based_cfg.task_stack = 4 * 1024;
+    periph_service_handle_t input_ser = input_key_service_create(&input_cfg);
+    input_key_service_add_key(input_ser, input_key_info, INPUT_KEY_NUM);
+    periph_service_set_callback(input_ser, input_key_service_cb, (void*)board_handle);
+    periph_service_state_t input_ser_state = get_input_key_service_state(input_ser);
+    if (input_ser_state == PERIPH_SERVICE_STATE_RUNNING){
+        ESP_LOGI(TAG, "input service running");
+    } else if (input_ser_state == PERIPH_SERVICE_STATE_STOPPED) {
+        ESP_LOGI(TAG, "input service stopped");
+    }
 
     ESP_LOGI(TAG, "[3.0] Create audio pipeline for playback");
     audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
@@ -254,7 +423,10 @@ void app_main(void)
     audio_pipeline_link(pipeline, &link_tag[0], 3);
 
     ESP_LOGI(TAG, "[3.6] Set up  uri (file as fatfs_stream, mp3 as mp3 decoder, and default output is i2s)");
-    audio_element_set_uri(fatfs_stream_reader, "/sdcard/test.mp3");
+    char* url = NULL;
+    sdcard_list_next(sdcard_list_handle, 1, &url);
+    ESP_LOGW(TAG, "URL: %s", url);
+    audio_element_set_uri(fatfs_stream_reader, url);
 
     ESP_LOGI(TAG, "[3.7] Create bt peripheral");
     esp_periph_handle_t bt_periph = bt_create_periph();
@@ -262,75 +434,78 @@ void app_main(void)
     ESP_LOGI(TAG, "[3.8] Start bt peripheral");
     esp_periph_start(set, bt_periph);
 
-    ESP_LOGI(TAG, "[ 4 ] Set up  event listener");
-    audio_event_iface_cfg_t evt_cfg = AUDIO_EVENT_IFACE_DEFAULT_CFG();
-    audio_event_iface_handle_t evt = audio_event_iface_init(&evt_cfg);
+    // ESP_LOGI(TAG, "[ 4 ] Set up  event listener");
+    // audio_event_iface_cfg_t evt_cfg = AUDIO_EVENT_IFACE_DEFAULT_CFG();
+    // audio_event_iface_handle_t evt = audio_event_iface_init(&evt_cfg);
 
-    ESP_LOGI(TAG, "[4.1] Listening event from all elements of pipeline");
-    audio_pipeline_set_listener(pipeline, evt);
+    // ESP_LOGI(TAG, "[4.1] Listening event from all elements of pipeline");
+    // audio_pipeline_set_listener(pipeline, evt);
 
-    ESP_LOGI(TAG, "[4.2] Listening event from peripherals");
-    audio_event_iface_set_listener(esp_periph_set_get_event_iface(set), evt);
+    // ESP_LOGI(TAG, "[4.2] Listening event from peripherals");
+    // audio_event_iface_set_listener(esp_periph_set_get_event_iface(set), evt);
 
     ESP_LOGI(TAG, "[ 5 ] Start audio_pipeline");
     audio_pipeline_run(pipeline);
+    return;
 
-    ESP_LOGI(TAG, "[ 6 ] Listen for all pipeline events");
-    while (1) {
-        audio_event_iface_msg_t msg;
-        esp_err_t ret = audio_event_iface_listen(evt, &msg, portMAX_DELAY);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "[ * ] Event interface error : %d", ret);
-            continue;
-        }
+    // ESP_LOGI(TAG, "[ 6 ] Listen for all pipeline events");
+    // while (1) {
+    //     audio_event_iface_msg_t msg;
+    //     esp_err_t ret = audio_event_iface_listen(evt, &msg, portMAX_DELAY);
+    //     if (ret != ESP_OK) {
+    //         ESP_LOGE(TAG, "[ * ] Event interface error : %d", ret);
+    //         continue;
+    //     }
 
-        if (msg.source_type == AUDIO_ELEMENT_TYPE_ELEMENT
-            && msg.source == (void *) mp3_decoder
-            && msg.cmd == AEL_MSG_CMD_REPORT_MUSIC_INFO) {
-            audio_element_info_t music_info = {0};
-            audio_element_getinfo(mp3_decoder, &music_info);
+    //     if (msg.source_type == AUDIO_ELEMENT_TYPE_ELEMENT
+    //         && msg.source == (void *) mp3_decoder
+    //         && msg.cmd == AEL_MSG_CMD_REPORT_MUSIC_INFO) {
+    //         audio_element_info_t music_info = {0};
+    //         audio_element_getinfo(mp3_decoder, &music_info);
 
-            ESP_LOGI(TAG, "[ * ] Receive music info from mp3 decoder, sample_rates=%d, bits=%d, ch=%d",
-                     music_info.sample_rates, music_info.bits, music_info.channels);
-            continue;
-        }
-        if (msg.source_type == PERIPH_ID_BLUETOOTH
-            && msg.source == (void *)bt_periph) {
-            if ((msg.cmd == PERIPH_BLUETOOTH_DISCONNECTED) || (msg.cmd == PERIPH_BLUETOOTH_AUDIO_SUSPENDED)) {
-                ESP_LOGW(TAG, "[ * ] Bluetooth disconnected or suspended");
-                periph_bt_stop(bt_periph);
-                break;
-            }
-        }
-    }
+    //         ESP_LOGI(TAG, "[ * ] Receive music info from mp3 decoder, sample_rates=%d, bits=%d, ch=%d",
+    //                  music_info.sample_rates, music_info.bits, music_info.channels);
+    //         continue;
+    //     }
+    //     if (msg.source_type == PERIPH_ID_BLUETOOTH
+    //         && msg.source == (void *)bt_periph) {
+    //         if ((msg.cmd == PERIPH_BLUETOOTH_DISCONNECTED) || (msg.cmd == PERIPH_BLUETOOTH_AUDIO_SUSPENDED)) {
+    //             ESP_LOGW(TAG, "[ * ] Bluetooth disconnected or suspended");
+    //             periph_bt_stop(bt_periph);
+    //             break;
+    //         }
+    //     }
+    // }
 
-    ESP_LOGI(TAG, "[ 7 ] Stop audio_pipeline");
-    audio_pipeline_stop(pipeline);
-    audio_pipeline_wait_for_stop(pipeline);
-    audio_pipeline_terminate(pipeline);
+    // ESP_LOGI(TAG, "[ 7 ] Stop audio_pipeline");
+    // audio_pipeline_stop(pipeline);
+    // audio_pipeline_wait_for_stop(pipeline);
+    // audio_pipeline_terminate(pipeline);
 
-    /* Terminal the pipeline before removing the listener */
-    audio_pipeline_remove_listener(pipeline);
+    // /* Terminal the pipeline before removing the listener */
+    // audio_pipeline_remove_listener(pipeline);
 
-    /* Stop all periph before removing the listener */
-    esp_periph_set_stop_all(set);
-    audio_event_iface_remove_listener(esp_periph_set_get_event_iface(set), evt);
+    // /* Stop all periph before removing the listener */
+    // esp_periph_set_stop_all(set);
+    // audio_event_iface_remove_listener(esp_periph_set_get_event_iface(set), evt);
 
-    /* Make sure audio_pipeline_remove_listener & audio_event_iface_remove_listener are called before destroying event_iface */
-    audio_event_iface_destroy(evt);
+    // /* Make sure audio_pipeline_remove_listener & audio_event_iface_remove_listener are called before destroying event_iface */
+    // audio_event_iface_destroy(evt);
 
-    /* Release all resources */
-    audio_pipeline_unregister(pipeline, bt_stream_writer);
-    audio_pipeline_unregister(pipeline, fatfs_stream_reader);
-    audio_pipeline_unregister(pipeline, mp3_decoder);
-    audio_pipeline_deinit(pipeline);
-    audio_element_deinit(bt_stream_writer);
-    audio_element_deinit(fatfs_stream_reader);
-    audio_element_deinit(mp3_decoder);
-    esp_periph_set_destroy(set);
-    esp_bluedroid_disable();
-    esp_bluedroid_deinit();
-    esp_bt_controller_disable();
-    esp_bt_controller_deinit();
-    esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+    // /* Release all resources */
+    // audio_pipeline_unregister(pipeline, bt_stream_writer);
+    // audio_pipeline_unregister(pipeline, fatfs_stream_reader);
+    // audio_pipeline_unregister(pipeline, mp3_decoder);
+    // sdcard_list_destroy(sdcard_list_handle);
+    // audio_pipeline_deinit(pipeline);
+    // audio_element_deinit(bt_stream_writer);
+    // audio_element_deinit(fatfs_stream_reader);
+    // audio_element_deinit(mp3_decoder);
+    // esp_periph_set_destroy(set);
+    // periph_service_destroy(input_ser);
+    // esp_bluedroid_disable();
+    // esp_bluedroid_deinit();
+    // esp_bt_controller_disable();
+    // esp_bt_controller_deinit();
+    // esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
 }
